@@ -23,5 +23,24 @@ func now()string{return time.Now().UTC().Format(time.RFC3339)}
 func(d *DB)Create(e *Deal)error{e.ID=genID();e.CreatedAt=now();_,err:=d.db.Exec(`INSERT INTO deals(id,name,company,contact_name,contact_email,value,stage,probability,close_date,notes,created_at)VALUES(?,?,?,?,?,?,?,?,?,?,?)`,e.ID,e.Name,e.Company,e.ContactName,e.ContactEmail,e.Value,e.Stage,e.Probability,e.CloseDate,e.Notes,e.CreatedAt);return err}
 func(d *DB)Get(id string)*Deal{var e Deal;if d.db.QueryRow(`SELECT id,name,company,contact_name,contact_email,value,stage,probability,close_date,notes,created_at FROM deals WHERE id=?`,id).Scan(&e.ID,&e.Name,&e.Company,&e.ContactName,&e.ContactEmail,&e.Value,&e.Stage,&e.Probability,&e.CloseDate,&e.Notes,&e.CreatedAt)!=nil{return nil};return &e}
 func(d *DB)List()[]Deal{rows,_:=d.db.Query(`SELECT id,name,company,contact_name,contact_email,value,stage,probability,close_date,notes,created_at FROM deals ORDER BY created_at DESC`);if rows==nil{return nil};defer rows.Close();var o []Deal;for rows.Next(){var e Deal;rows.Scan(&e.ID,&e.Name,&e.Company,&e.ContactName,&e.ContactEmail,&e.Value,&e.Stage,&e.Probability,&e.CloseDate,&e.Notes,&e.CreatedAt);o=append(o,e)};return o}
+func(d *DB)Update(e *Deal)error{_,err:=d.db.Exec(`UPDATE deals SET name=?,company=?,contact_name=?,contact_email=?,value=?,stage=?,probability=?,close_date=?,notes=? WHERE id=?`,e.Name,e.Company,e.ContactName,e.ContactEmail,e.Value,e.Stage,e.Probability,e.CloseDate,e.Notes,e.ID);return err}
 func(d *DB)Delete(id string)error{_,err:=d.db.Exec(`DELETE FROM deals WHERE id=?`,id);return err}
 func(d *DB)Count()int{var n int;d.db.QueryRow(`SELECT COUNT(*) FROM deals`).Scan(&n);return n}
+
+func(d *DB)Search(q string, filters map[string]string)[]Deal{
+    where:="1=1"
+    args:=[]any{}
+    if q!=""{
+        where+=" AND (name LIKE ? OR company LIKE ?)"
+        args=append(args,"%"+q+"%");args=append(args,"%"+q+"%");
+    }
+    if v,ok:=filters["stage"];ok&&v!=""{where+=" AND stage=?";args=append(args,v)}
+    rows,_:=d.db.Query(`SELECT id,name,company,contact_name,contact_email,value,stage,probability,close_date,notes,created_at FROM deals WHERE `+where+` ORDER BY created_at DESC`,args...)
+    if rows==nil{return nil};defer rows.Close()
+    var o []Deal;for rows.Next(){var e Deal;rows.Scan(&e.ID,&e.Name,&e.Company,&e.ContactName,&e.ContactEmail,&e.Value,&e.Stage,&e.Probability,&e.CloseDate,&e.Notes,&e.CreatedAt);o=append(o,e)};return o
+}
+
+func(d *DB)Stats()map[string]any{
+    m:=map[string]any{"total":d.Count()}
+    return m
+}
