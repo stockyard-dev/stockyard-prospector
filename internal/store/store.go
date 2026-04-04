@@ -42,5 +42,15 @@ func(d *DB)Search(q string, filters map[string]string)[]Deal{
 
 func(d *DB)Stats()map[string]any{
     m:=map[string]any{"total":d.Count()}
+    var pipeline int
+    d.db.QueryRow(`SELECT COALESCE(SUM(value),0) FROM deals WHERE stage NOT IN ('won','lost')`).Scan(&pipeline)
+    m["pipeline_value"]=pipeline
+    var won int
+    d.db.QueryRow(`SELECT COALESCE(SUM(value),0) FROM deals WHERE stage='won'`).Scan(&won)
+    m["won_value"]=won
+    byStage:=map[string]int{}
+    rows,_:=d.db.Query(`SELECT stage,COUNT(*) FROM deals GROUP BY stage`)
+    if rows!=nil{defer rows.Close();for rows.Next(){var s string;var c int;rows.Scan(&s,&c);byStage[s]=c}}
+    m["by_stage"]=byStage
     return m
 }
