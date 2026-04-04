@@ -55,10 +55,5 @@ func (s *Server) setStage(w http.ResponseWriter, r *http.Request) {
 	d.Stage = body.Stage; s.db.Update(d); wj(w, 200, s.db.Get(d.ID))
 }
 func (s *Server) del(w http.ResponseWriter, r *http.Request) { s.db.Delete(r.PathValue("id")); wj(w, 200, map[string]string{"status": "deleted"}) }
-func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
-	deals := s.db.List(); if deals == nil { deals = []store.Deal{} }
-	pipeline := map[string]int{}; totalValue := 0; weighted := 0
-	for _, d := range deals { pipeline[d.Stage]++; totalValue += d.Value; weighted += d.Value * d.Probability / 100 }
-	wj(w, 200, map[string]any{"total": len(deals), "pipeline": pipeline, "total_value": totalValue, "weighted_value": weighted})
-}
+func (s *Server) stats(w http.ResponseWriter, r *http.Request) { wj(w, 200, s.db.Stats()) }
 func (s *Server) health(w http.ResponseWriter, r *http.Request) { wj(w, 200, map[string]any{"service": "prospector", "status": "ok", "deals": s.db.Count()}) }
