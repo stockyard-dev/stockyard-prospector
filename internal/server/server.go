@@ -2,58 +2,315 @@ package server
 
 import (
 	"encoding/json"
+	"io"
+	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 
 	"github.com/stockyard-dev/stockyard-prospector/internal/store"
 )
 
-type Server struct{ db *store.DB; mux *http.ServeMux; limits Limits }
+// resourceName is the canonical key for extras storage and the API path.
+const resourceName = "deals"
 
-func New(db *store.DB, limits Limits) *Server {
-	s := &Server{db: db, mux: http.NewServeMux(), limits: limits}
+type Server struct {
+	db      *store.DB
+	mux     *http.ServeMux
+	limits  Limits
+	dataDir string
+	pCfg    map[string]json.RawMessage
+}
+
+func New(db *store.DB, limits Limits, dataDir string) *Server {
+	s := &Server{
+		db:      db,
+		mux:     http.NewServeMux(),
+		limits:  limits,
+		dataDir: dataDir,
+	}
+	s.loadPersonalConfig()
+
+	// Deal CRUD
 	s.mux.HandleFunc("GET /api/deals", s.list)
 	s.mux.HandleFunc("POST /api/deals", s.create)
 	s.mux.HandleFunc("GET /api/deals/{id}", s.get)
 	s.mux.HandleFunc("PUT /api/deals/{id}", s.update)
 	s.mux.HandleFunc("PATCH /api/deals/{id}/stage", s.setStage)
 	s.mux.HandleFunc("DELETE /api/deals/{id}", s.del)
+
+	// Stats / health
 	s.mux.HandleFunc("GET /api/stats", s.stats)
 	s.mux.HandleFunc("GET /api/health", s.health)
-	s.mux.HandleFunc("GET /api/tier", func(w http.ResponseWriter, r *http.Request) { wj(w, 200, map[string]any{"tier": s.limits.Tier, "upgrade_url": "https://stockyard.dev/prospector/"}) })
+
+	// Personalization
+	s.mux.HandleFunc("GET /api/config", s.configHandler)
+
+	// Extras (custom fields)
+	s.mux.HandleFunc("GET /api/extras/{resource}", s.listExtras)
+	s.mux.HandleFunc("GET /api/extras/{resource}/{id}", s.getExtras)
+	s.mux.HandleFunc("PUT /api/extras/{resource}/{id}", s.putExtras)
+
+	// Dashboard
 	s.mux.HandleFunc("GET /ui", s.dashboard)
 	s.mux.HandleFunc("GET /ui/", s.dashboard)
 	s.mux.HandleFunc("GET /", s.root)
+
+	// Tier
+	s.mux.HandleFunc("GET /api/tier", func(w http.ResponseWriter, r *http.Request) {
+		wj(w, 200, map[string]any{
+			"tier":        s.limits.Tier,
+			"upgrade_url": "https://stockyard.dev/prospector/",
+		})
+	})
+
 	return s
 }
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
-func wj(w http.ResponseWriter, c int, v any) { w.Header().Set("Content-Type", "application/json"); w.WriteHeader(c); json.NewEncoder(w).Encode(v) }
-func we(w http.ResponseWriter, c int, m string) { wj(w, c, map[string]string{"error": m}) }
-func (s *Server) root(w http.ResponseWriter, r *http.Request) { if r.URL.Path != "/" { http.NotFound(w, r); return }; http.Redirect(w, r, "/ui", 302) }
-func od(d []store.Deal) []store.Deal { if d == nil { return []store.Deal{} }; return d }
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mux.ServeHTTP(w, r)
+}
+
+// ─── helpers ──────────────────────────────────────────────────────
+
+func wj(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
+}
+
+func we(w http.ResponseWriter, code int, msg string) {
+	wj(w, code, map[string]string{"error": msg})
+}
+
+func od(d []store.Deal) []store.Deal {
+	if d == nil {
+		return []store.Deal{}
+	}
+	return d
+}
+
+func (s *Server) root(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	http.Redirect(w, r, "/ui", 302)
+}
+
+// ─── personalization ──────────────────────────────────────────────
+
+func (s *Server) loadPersonalConfig() {
+	path := filepath.Join(s.dataDir, "config.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var cfg map[string]json.RawMessage
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Printf("prospector: warning: could not parse config.json: %v", err)
+		return
+	}
+	s.pCfg = cfg
+	log.Printf("prospector: loaded personalization from %s", path)
+}
+
+func (s *Server) configHandler(w http.ResponseWriter, r *http.Request) {
+	if s.pCfg == nil {
+		wj(w, 200, map[string]any{})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(s.pCfg)
+}
+
+// ─── extras ───────────────────────────────────────────────────────
+
+func (s *Server) listExtras(w http.ResponseWriter, r *http.Request) {
+	resource := r.PathValue("resource")
+	all := s.db.AllExtras(resource)
+	out := make(map[string]json.RawMessage, len(all))
+	for id, data := range all {
+		out[id] = json.RawMessage(data)
+	}
+	wj(w, 200, out)
+}
+
+func (s *Server) getExtras(w http.ResponseWriter, r *http.Request) {
+	resource := r.PathValue("resource")
+	id := r.PathValue("id")
+	data := s.db.GetExtras(resource, id)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(data))
+}
+
+func (s *Server) putExtras(w http.ResponseWriter, r *http.Request) {
+	resource := r.PathValue("resource")
+	id := r.PathValue("id")
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		we(w, 400, "read body")
+		return
+	}
+	var probe map[string]any
+	if err := json.Unmarshal(body, &probe); err != nil {
+		we(w, 400, "invalid json")
+		return
+	}
+	if err := s.db.SetExtras(resource, id, string(body)); err != nil {
+		we(w, 500, "save failed")
+		return
+	}
+	wj(w, 200, map[string]string{"ok": "saved"})
+}
+
+// ─── deal CRUD ────────────────────────────────────────────────────
 
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {
-	stage := r.URL.Query().Get("stage"); q := r.URL.Query().Get("q")
-	filters := map[string]string{}; if stage != "" { filters["stage"] = stage }
-	if q != "" || len(filters) > 0 { wj(w, 200, map[string]any{"deals": od(s.db.Search(q, filters))}); return }
+	q := r.URL.Query().Get("q")
+	stage := r.URL.Query().Get("stage")
+	filters := map[string]string{}
+	if stage != "" {
+		filters["stage"] = stage
+	}
+	if q != "" || len(filters) > 0 {
+		wj(w, 200, map[string]any{"deals": od(s.db.Search(q, filters))})
+		return
+	}
 	wj(w, 200, map[string]any{"deals": od(s.db.List())})
 }
+
 func (s *Server) create(w http.ResponseWriter, r *http.Request) {
-	if s.limits.MaxItems > 0 && s.db.Count() >= s.limits.MaxItems { we(w, 402, "Free tier limit reached"); return }
-	var d store.Deal; json.NewDecoder(r.Body).Decode(&d); if d.Name == "" { we(w, 400, "name required"); return }
-	if d.Stage == "" { d.Stage = "lead" }; s.db.Create(&d); wj(w, 201, s.db.Get(d.ID))
+	if s.limits.MaxItems > 0 && s.db.Count() >= s.limits.MaxItems {
+		we(w, 402, "Free tier limit reached. Upgrade at https://stockyard.dev/prospector/")
+		return
+	}
+	var d store.Deal
+	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
+		we(w, 400, "invalid json")
+		return
+	}
+	if d.Name == "" {
+		we(w, 400, "name required")
+		return
+	}
+	if d.Stage == "" {
+		d.Stage = "lead"
+	}
+	if err := s.db.Create(&d); err != nil {
+		we(w, 500, "create failed")
+		return
+	}
+	wj(w, 201, s.db.Get(d.ID))
 }
-func (s *Server) get(w http.ResponseWriter, r *http.Request) { d := s.db.Get(r.PathValue("id")); if d == nil { we(w, 404, "not found"); return }; wj(w, 200, d) }
+
+func (s *Server) get(w http.ResponseWriter, r *http.Request) {
+	d := s.db.Get(r.PathValue("id"))
+	if d == nil {
+		we(w, 404, "not found")
+		return
+	}
+	wj(w, 200, d)
+}
+
+// update accepts a full or partial deal. Empty string fields preserve
+// the existing values. Value=0 and Probability=0 also preserve, since
+// the dashboard always sends them — receiving zero almost always means
+// "field omitted from a partial PUT" rather than "set to literal zero".
 func (s *Server) update(w http.ResponseWriter, r *http.Request) {
-	existing := s.db.Get(r.PathValue("id")); if existing == nil { we(w, 404, "not found"); return }
-	var d store.Deal; json.NewDecoder(r.Body).Decode(&d); d.ID = existing.ID; d.CreatedAt = existing.CreatedAt
-	if d.Name == "" { d.Name = existing.Name }; if d.Stage == "" { d.Stage = existing.Stage }
-	s.db.Update(&d); wj(w, 200, s.db.Get(d.ID))
+	existing := s.db.Get(r.PathValue("id"))
+	if existing == nil {
+		we(w, 404, "not found")
+		return
+	}
+	var patch store.Deal
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		we(w, 400, "invalid json")
+		return
+	}
+	patch.ID = existing.ID
+	patch.CreatedAt = existing.CreatedAt
+	if patch.Name == "" {
+		patch.Name = existing.Name
+	}
+	if patch.Company == "" {
+		patch.Company = existing.Company
+	}
+	if patch.ContactName == "" {
+		patch.ContactName = existing.ContactName
+	}
+	if patch.ContactEmail == "" {
+		patch.ContactEmail = existing.ContactEmail
+	}
+	if patch.Value == 0 {
+		patch.Value = existing.Value
+	}
+	if patch.Stage == "" {
+		patch.Stage = existing.Stage
+	}
+	if patch.Probability == 0 {
+		patch.Probability = existing.Probability
+	}
+	if patch.CloseDate == "" {
+		patch.CloseDate = existing.CloseDate
+	}
+	if patch.Notes == "" {
+		patch.Notes = existing.Notes
+	}
+	if err := s.db.Update(&patch); err != nil {
+		we(w, 500, "update failed")
+		return
+	}
+	wj(w, 200, s.db.Get(patch.ID))
 }
+
+// setStage is the kanban quick-move handler. PATCH-style — only changes stage.
 func (s *Server) setStage(w http.ResponseWriter, r *http.Request) {
-	d := s.db.Get(r.PathValue("id")); if d == nil { we(w, 404, "not found"); return }
-	var body struct { Stage string `json:"stage"` }; json.NewDecoder(r.Body).Decode(&body)
-	d.Stage = body.Stage; s.db.Update(d); wj(w, 200, s.db.Get(d.ID))
+	d := s.db.Get(r.PathValue("id"))
+	if d == nil {
+		we(w, 404, "not found")
+		return
+	}
+	var body struct {
+		Stage string `json:"stage"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		we(w, 400, "invalid json")
+		return
+	}
+	if body.Stage == "" {
+		we(w, 400, "stage required")
+		return
+	}
+	d.Stage = body.Stage
+	if err := s.db.Update(d); err != nil {
+		we(w, 500, "update failed")
+		return
+	}
+	wj(w, 200, s.db.Get(d.ID))
 }
-func (s *Server) del(w http.ResponseWriter, r *http.Request) { s.db.Delete(r.PathValue("id")); wj(w, 200, map[string]string{"status": "deleted"}) }
-func (s *Server) stats(w http.ResponseWriter, r *http.Request) { wj(w, 200, s.db.Stats()) }
-func (s *Server) health(w http.ResponseWriter, r *http.Request) { wj(w, 200, map[string]any{"service": "prospector", "status": "ok", "deals": s.db.Count()}) }
+
+func (s *Server) del(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	s.db.Delete(id)
+	s.db.DeleteExtras(resourceName, id)
+	wj(w, 200, map[string]string{"deleted": "ok"})
+}
+
+// ─── stats / health ───────────────────────────────────────────────
+
+func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
+	wj(w, 200, s.db.Stats())
+}
+
+func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	wj(w, 200, map[string]any{
+		"status":  "ok",
+		"service": "prospector",
+		"deals":   s.db.Count(),
+	})
+}
+
+func init() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+}
